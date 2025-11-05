@@ -5,8 +5,6 @@ import lombok.Data;
 /**
  * 文生图请求DTO
  * 
- * <p>用户提交文生图任务的请求参数，包含各项生图配置
- * 
  * @author itcast
  * @since 1.0
  */
@@ -42,11 +40,7 @@ public class Text2ImageReqDto {
     /** 客户端ID */
     String clientId;
 
-    /**
-     * 获取模型名称
-     * 
-     * @return 模型文件名
-     */
+    /** 获取模型名称 */
     public String modelName(){
         switch (model){
             case 2:
@@ -56,11 +50,7 @@ public class Text2ImageReqDto {
         }
     }
 
-    /**
-     * 获取采样器名称
-     * 
-     * @return 采样器名称
-     */
+    /** 获取采样器名称 */
     public String samplerName(){
         switch (sampler){
             case 1:

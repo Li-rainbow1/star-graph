@@ -1,9 +1,9 @@
 package cn.itcast.star.graph.core.job;
 
-import cn.hutool.core.date.DateTime;
 import cn.itcast.star.graph.comfyui.client.api.ComfyuiApi;
 import cn.itcast.star.graph.comfyui.client.pojo.ComfyuiTask;
 import cn.itcast.star.graph.core.service.RedisService;
+import cn.itcast.star.graph.core.service.RefundCompensationService;
 import cn.itcast.star.graph.core.service.UserFundRecordService;
 import lombok.extern.log4j.Log4j2;
 import org.redisson.api.RLock;
@@ -18,28 +18,13 @@ import retrofit2.Response;
 import java.util.HashMap;
 
 /**
- * 任务调度定时任务
- * 
- * <p>负责从Redis队列中取出文生图任务并提交给ComfyUI执行
- * 
- * <p>主要功能：
- * <ul>
- *     <li>每秒轮询一次Redis队列</li>
- *     <li>使用分布式锁防止并发执行</li>
- *     <li>使用信号量控制并发任务数量</li>
- *     <li>提交任务到ComfyUI</li>
- * </ul>
- * 
- * @author itcast
- * @since 1.0
+ * 任务调度定时任务 - 每秒从Redis队列取任务提交给ComfyUI
+ * 使用分布式锁防止集群重复执行，使用信号量控制并发数
  */
 @Component
 @Log4j2
 public class RunTaskJob {
-    /** 定时任务分布式锁key */
     final static String SPRING_TASK_LOCK_KEY = "SPRING_TASK_LOCK_KEY";
-    
-    /** 任务运行信号量key，用于控制并发执行的任务数 */
     public final static String TASK_RUN_SEMAPHORE = "TASK_RUN_SEMAPHORE";
 
     @Autowired
@@ -50,127 +35,107 @@ public class RunTaskJob {
     RedissonClient redissonClient;
     @Autowired
     UserFundRecordService userFundRecordService;
+    @Autowired
+    RefundCompensationService refundCompensationService;
 
     /**
-     * 把任务发送给ComfyUI
-     * 
-     * <p>执行流程：
-     * <ol>
-     *     <li>从Redis队列取出优先级最高的任务</li>
-     *     <li>调用ComfyUI API提交任务</li>
-     *     <li>成功：保存promptId到已启动任务列表</li>
-     *     <li>失败：释放信号量并归还冻结积分</li>
-     * </ol>
+     * 释放信号量
+     */
+    private void releaseSemaphore(String reason) {
+        RSemaphore semaphore = redissonClient.getSemaphore(TASK_RUN_SEMAPHORE);
+        semaphore.release();
+        log.info("{}, 释放信号量，当前可用许可: {}", reason, semaphore.availablePermits());
+    }
+    
+    /**
+     * 从队列弹出任务并提交到ComfyUI
+     * 1. 从Redis队列中弹出任务
+     * 2. 提交任务到ComfyUI
+     * 3. 处理ComfyUI响应结果
      */
     private void sendTaskToComfyui() {
-        // 从Redis优先级队列中弹出优先级最高的任务（分值最小的任务）
         ComfyuiTask comfyuiTask = redisService.popQueueTask();
-        // 如果队列为空或数据异常，释放信号量后返回
         if (comfyuiTask == null) {
-            // 【Bug修复】必须释放已获取的信号量，否则会导致信号量永久泄露
-            RSemaphore semaphore = redissonClient.getSemaphore(TASK_RUN_SEMAPHORE);
-            semaphore.release();
-            log.warn("从队列获取任务失败（队列为空或数据异常），释放信号量");
+            releaseSemaphore("从队列获取任务失败");
             return;
         }
-        // 调用ComfyUI API的addQueueTask接口，创建Retrofit的Call对象
+        
         Call<HashMap> hashMapCall = comfyuiApi.addQueueTask(comfyuiTask.getComfyuiRequestDto());
         try {
-            // 同步执行HTTP请求，等待ComfyUI响应
             Response<HashMap> response = hashMapCall.execute();
-            // 判断HTTP响应是否成功（状态码2xx）
             if (response.isSuccessful()) {
-                // 获取响应体数据
                 HashMap body = response.body();
-                // 【Bug修复】添加空值检查
                 if (body == null || body.get("prompt_id") == null) {
                     log.error("ComfyUI响应数据异常，body或prompt_id为null");
-                    // 获取任务运行信号量
-                    RSemaphore semaphore = redissonClient.getSemaphore(TASK_RUN_SEMAPHORE);
-                    // 释放信号量许可
-                    semaphore.release();
-                    // 任务失败，归还用户冻结的积分
-                    userFundRecordService.freezeReturn(comfyuiTask.getUserId(), comfyuiTask.getSize());
-                    // 删除临时占位符
+                    releaseSemaphore("ComfyUI响应数据异常");
+                    refundCompensationService.safeRefund(comfyuiTask.getUserId(), comfyuiTask.getSize(), 
+                            "temp_" + comfyuiTask.getId(), "comfyui_response_error_refund_failed");
                     redisService.removeStartedTask("temp_" + comfyuiTask.getId());
                     return;
                 }
-                // 从响应中提取ComfyUI分配的任务ID（promptId）
                 String promptId = (String) body.get("prompt_id");
-                // 将promptId设置到任务对象中
                 comfyuiTask.setPromptId(promptId);
-                // 记录任务提交成功日志
                 log.info("添加任务到Comfyui成功：{}", comfyuiTask.getPromptId());
-                // 将任务保存到"已启动任务"列表，用于后续接收ComfyUI的执行结果
+                // 将任务标记为“已开始执行”，用于后续WS消息匹配、排名计算
                 redisService.addStartedTask(promptId, comfyuiTask);
             } else {
-                // 提交失败，获取错误信息
                 String error = response.errorBody().string();
-                // 记录错误日志
                 log.error("添加任务到Comfyui错误: {}", error);
-                // 获取任务运行信号量
-                RSemaphore semaphore = redissonClient.getSemaphore(TASK_RUN_SEMAPHORE);
-                // 释放信号量许可，因为任务提交失败，需要归还许可供其他任务使用
-                semaphore.release();
-                // 任务失败，归还用户冻结的积分（按图片数量）
-                userFundRecordService.freezeReturn(comfyuiTask.getUserId(), comfyuiTask.getSize());
-                // 删除临时占位符，保证数据一致性
+                releaseSemaphore("ComfyUI提交失败");
+                refundCompensationService.safeRefund(comfyuiTask.getUserId(), comfyuiTask.getSize(), 
+                        "temp_" + comfyuiTask.getId(), "comfyui_submit_error_refund_failed");
                 redisService.removeStartedTask("temp_" + comfyuiTask.getId());
             }
         } catch (Exception e) {
-            // 捕获异常并记录详细日志
             log.error("提交任务到Comfyui发生异常: {}", e.getMessage(), e);
-            // 【重要】发生异常时必须释放信号量，否则会导致信号量泄露，后续任务无法执行
-            RSemaphore semaphore = redissonClient.getSemaphore(TASK_RUN_SEMAPHORE);
-            semaphore.release();
-            // 任务失败，归还用户冻结的积分（comfyuiTask在此时一定不为null）
-            userFundRecordService.freezeReturn(comfyuiTask.getUserId(), comfyuiTask.getSize());
-            // 删除临时占位符，保证数据一致性
+            releaseSemaphore("提交任务异常");
+            refundCompensationService.safeRefund(comfyuiTask.getUserId(), comfyuiTask.getSize(), 
+                    "temp_" + comfyuiTask.getId(), "comfyui_submit_exception_refund_failed");
             redisService.removeStartedTask("temp_" + comfyuiTask.getId());
         }
     }
 
-
     /**
-     * 定时任务调度方法
+     * 定时任务入口，每秒执行一次（获取分布式锁和信号量后执行）
      * 
-     * <p>每秒执行一次，检查队列中是否有任务需要处理
+     * <p>调度策略：
+     * <ul>
+     *     <li>使用fixedDelay而非cron：避免任务堆积，确保上次执行完成后再开始</li>
+     *     <li>1秒间隔：快速响应队列中的任务</li>
+     *     <li>分布式锁：防止集群环境下多实例并发执行</li>
+     *     <li>信号量控制：限制并发提交到ComfyUI的任务数</li>
+     * </ul>
      * 
-     * <p>使用分布式锁保证在集群环境下只有一个实例执行
-     * <p>使用信号量控制同时运行的任务数量，防止ComfyUI过载
+     * <p>执行流程：
+     * <ol>
+     *     <li>获取分布式锁，防止集群重复执行</li>
+     *     <li>快速判断是否有待处理任务，避免无任务时重复获取信号量</li>
+     *     <li>通过信号量限制并发提交到ComfyUI的任务数，获取失败则跳过本轮</li>
+     * </ol>
      */
-    @Scheduled(cron = "*/1 * * * * ?")
+    @Scheduled(fixedDelay = 1000)  // 上次执行完成后延迟1秒
     public void task() {
-        // 获取分布式锁，确保在集群环境下只有一个节点执行定时任务
+        // 使用分布式锁，保证同一时间仅有一个实例执行取队列与提交逻辑
         RLock lock = redissonClient.getLock(SPRING_TASK_LOCK_KEY);
-        // 尝试获取锁（非阻塞），如果获取失败则本次不执行
         if (lock.tryLock()) {
             try {
-                // 检查Redis队列中是否有待处理的任务
+                // 快速判断是否有待处理任务，避免无任务时重复获取信号量
                 if (redisService.hasQueueTask()) {
-                    // 获取任务运行信号量，用于控制ComfyUI的并发任务数
                     RSemaphore semaphore = redissonClient.getSemaphore(TASK_RUN_SEMAPHORE);
-                    // 打印当前可用的信号量许可数（用于监控和调试）
-                    System.out.println(DateTime.now() + "\t\t获取许可数量" + semaphore.availablePermits());
-                    // 尝试获取一个信号量许可（非阻塞）
-                    // 如果获取成功，说明ComfyUI还有空闲资源可以执行新任务
+                    log.debug("当前可用信号量: {}", semaphore.availablePermits());
+                    // 通过信号量限制并发提交到ComfyUI的任务数，获取失败则跳过本轮
                     if (semaphore.tryAcquire()) {
-                        // 打印任务开始执行的时间
-                        System.out.println("===开关开启：>" + DateTime.now());
-                        // 从队列取出任务并提交给ComfyUI执行
+                        log.debug("获取信号量成功，开始处理任务");
+                        // 已获得许可，本轮负责从队列弹出并提交任务
                         sendTaskToComfyui();
                     }
-                    // 如果获取信号量失败，说明ComfyUI正在执行的任务数已达上限
-                    // 本次不执行，等待下一次定时任务触发
                 }
             } finally {
-                // 【Bug修复】检查当前线程是否持有锁，避免抛出IllegalMonitorStateException
+                // 仅释放当前线程持有的锁，避免误释放
                 if (lock.isHeldByCurrentThread()) {
                     lock.unlock();
                 }
             }
         }
-        // 如果获取分布式锁失败，说明其他节点正在执行，本次跳过
-
     }
 }

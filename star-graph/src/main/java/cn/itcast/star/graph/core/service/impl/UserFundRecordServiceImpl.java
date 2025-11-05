@@ -13,6 +13,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+/**
+ * 用户积分记录服务实现 - 管理积分冻结、扣除、归还等操作
+ */
 @Service
 @Transactional
 @Slf4j
@@ -22,10 +25,9 @@ public class UserFundRecordServiceImpl extends ServiceImpl<SgUserFundRecordMappe
     SgUserFundMapper sgUserFundMapper;
     @Autowired
     SgUserFundRecordMapper sgUserFundRecordMapper;
+    
     /**
-     * 积分冻结：指从用户积分账户拿出积分，增加到用户积分冻结账户上
-     * @param userId
-     * @param money
+     * 积分冻结：从可用账户扣除，增加到冻结账户
      */
     @Override
     public void pointsFreeze(Long userId, Integer money) {
@@ -57,9 +59,7 @@ public class UserFundRecordServiceImpl extends ServiceImpl<SgUserFundRecordMappe
     }
 
     /**
-     * 冻结归还：指从积分冻结账户上拿出积分，增加到用户积分账户上
-     * @param userId
-     * @param money
+     * 冻结归还：从冻结账户扣除，增加到可用账户
      */
     @Override
     public void freezeReturn(Long userId, Integer money) {
@@ -91,9 +91,7 @@ public class UserFundRecordServiceImpl extends ServiceImpl<SgUserFundRecordMappe
     }
 
     /**
-     * 积分扣除：指从用户积分冻结账号上拿出积分，增加到总账户的积分账户上
-     * @param userId
-     * @param money
+     * 积分扣除：从冻结账户扣除，增加到系统总账户（平台收入）
      */
     @Override
     public void pointsDeduction(Long userId, Integer money) {
@@ -135,9 +133,7 @@ public class UserFundRecordServiceImpl extends ServiceImpl<SgUserFundRecordMappe
     }
 
     /**
-     * 直接划扣：指从用户积分账户上拿出积分，增加到总账户的积分账户上
-     * @param userId
-     * @param money
+     * 直接划扣：从可用账户直接扣除，增加到系统总账户（用于插队等即时消费）
      */
     @Override
     public void directDeduction(Long userId, Integer money) {
@@ -198,9 +194,7 @@ public class UserFundRecordServiceImpl extends ServiceImpl<SgUserFundRecordMappe
     }
 
     /**
-     * 直接归还：用于直接扣除失败后的补偿，将积分归还到用户可用账户和系统总账户
-     * @param userId
-     * @param money
+     * 直接归还：从系统总账户扣除，归还到用户可用账户（用于补偿）
      */
     @Override
     public void directRefund(Long userId, Integer money) {
@@ -238,10 +232,7 @@ public class UserFundRecordServiceImpl extends ServiceImpl<SgUserFundRecordMappe
     }
 
     /**
-     * 获取用户积分账户信息，如果不存在则自动创建
-     * 
-     * @param userId 用户ID（0表示系统总账户）
-     * @return 用户积分账户对象
+     * 获取用户积分账户，不存在则自动创建（userId=0为系统总账户）
      */
     public SgUserFund getUserSgUserFund(long userId){
         // 根据用户ID查询积分账户

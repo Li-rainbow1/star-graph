@@ -5,8 +5,6 @@ import lombok.Data;
 /**
  * ComfyUI生图模型参数
  * 
- * <p>封装文生图任务的各项参数配置，包括模型选择、采样器设置、图片尺寸等
- * 
  * @author itcast
  * @since 1.0
  */

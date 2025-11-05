@@ -2,6 +2,7 @@ package cn.itcast.star.graph.core.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.itcast.star.graph.comfyui.client.api.ComfyuiApi;
 import cn.itcast.star.graph.comfyui.client.pojo.ComfyuiModel;
 import cn.itcast.star.graph.comfyui.client.pojo.ComfyuiRequestDto;
 import cn.itcast.star.graph.comfyui.client.pojo.ComfyuiTask;
@@ -25,6 +26,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
+import retrofit2.Response;
 
 import java.util.Collections;
 import java.util.List;
@@ -32,284 +34,221 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 文生图服务实现类
- * 
- * <p>实现文生图的核心业务逻辑，包括：
- * <ul>
- *     <li>创建文生图任务并加入队列</li>
- *     <li>取消排队中的任务</li>
- *     <li>任务插队（提升优先级）</li>
- *     <li>查询用户的生图历史</li>
- * </ul>
- * 
- * <p>关键技术点：
- * <ul>
- *     <li>使用分布式锁防止并发操作冲突</li>
- *     <li>Redis ZSet实现优先级队列</li>
- *     <li>积分冻结/扣除/归还机制</li>
- *     <li>Ollama AI翻译提示词</li>
- *     <li>Freemarker生成ComfyUI工作流</li>
- * </ul>
- * 
- * @author itcast
- * @since 1.0
+ * 文生图服务实现 - 处理任务创建、取消、插队等核心业务
  */
-@Slf4j  // Lombok注解，自动生成日志对象log
-@Service  // Spring Service组件注解
+@Slf4j
+@Service
 public class Text2ImageServiceImpl implements Text2ImageService {
-    // ==================== 依赖注入 ====================
     
-    @Autowired  // 注入Ollama服务，用于中英文翻译
+    @Autowired
     OllamaService ollamaService;
     
-    @Autowired  // 注入Freemarker服务，用于生成ComfyUI工作流JSON
+    @Autowired
     FreemarkerService freemarkerService;
     
-    @Autowired  // 注入Redis服务，用于任务队列管理
+    @Autowired
     RedisService redisService;
     
-    @Autowired  // 注入用户资金服务，用于积分冻结/扣除/归还
+    @Autowired
     UserFundRecordService userFundRecordService;
     
-    @Autowired  // 注入用户结果服务，用于保存生成的图片记录
+    @Autowired
     UserResultService userResultService;
     
-    @Autowired  // 注入Redis模板，用于实现分布式锁
+    @Autowired
     StringRedisTemplate stringRedisTemplate;
     
-    // ==================== 常量定义 ====================
+    @Autowired
+    ComfyuiApi comfyuiApi;
     
-    /** 分布式锁的key前缀，用于防止并发操作同一任务 */
+    @Autowired
+    RefundCompensationService refundCompensationService;
+    
     private static final String LOCK_KEY_PREFIX = "lock:task:";
-    
-    /** 分布式锁的超时时间（秒），防止死锁 */
     private static final long LOCK_TIMEOUT = 10;
-    
-    /** 任务插队消耗的积分数 */
     private static final int PRIORITY_COST = 5;
-    
-    /** 提升优先级时减少的分值（ZSet score越小优先级越高） */
     private static final double PRIORITY_INCREMENT = 10.0;
-    
-    /** 分页查询的最小页码 */
     private static final int MIN_PAGE_SIZE = 1;
-    
-    /** 分页查询的最大每页数量 */
     private static final int MAX_PAGE_SIZE = 20;
-    
-    /** 分页查询的默认每页数量 */
     private static final int DEFAULT_PAGE_SIZE = 10;
+    private static final int INTERRUPT_MAX_RETRIES = 3;  // 中断接口最大重试次数
+    private static final long INTERRUPT_RETRY_DELAY_MS = 500;  // 重试间隔(毫秒)
 
     /**
      * 把请求参数封装成comfyui的请求对象
-     *
-     * @param text2ImageReqDto
-     * @return
-     * @throws Exception
      */
     public ComfyuiTask getComfyuiTask(Text2ImageReqDto text2ImageReqDto) throws Exception {
-        // 创建ComfyUI模型参数对象
+        // 复制基础参数（将请求DTO映射到模型对象）
         ComfyuiModel comfyuiModel = new ComfyuiModel();
-        // 将请求参数复制到模型对象（忽略空值）
         BeanUtil.copyProperties(text2ImageReqDto, comfyuiModel, true);
-        // 根据用户选择的模型编号，设置对应的模型文件名
         comfyuiModel.setModelName(text2ImageReqDto.modelName());
-        // 根据用户选择的采样器编号，设置对应的采样器名称
         comfyuiModel.setSamplerName(text2ImageReqDto.samplerName());
-        // 设置调度器名称（固定使用karras）
         comfyuiModel.setScheduler(text2ImageReqDto.scheduler());
-        // 根据用户选择的尺寸比例，计算实际图片宽度
         comfyuiModel.setWidth(text2ImageReqDto.width());
-        // 根据用户选择的尺寸比例，计算实际图片高度
         comfyuiModel.setHeight(text2ImageReqDto.height());
 
-        // 处理正向提示词：添加画质增强前缀 + 使用Ollama翻译用户输入的中文提示词为英文
+        // 处理提示词：添加画质增强前缀并翻译（避免中英混合导致模型理解偏差）
         comfyuiModel.setPropmt("(8k, best quality, masterpiece),(high detailed skin)," + ollamaService.translate(text2ImageReqDto.getPropmt()));
-        // 处理负向提示词：翻译用户输入 + 添加常见负面词汇（避免生成低质量图片）
+        // 处理负面提示词：翻译并添加常见负面关键词（降低坏脸/多指等概率）
         comfyuiModel.setReverse(ollamaService.translate(text2ImageReqDto.getReverse()) + ",bad face,naked,bad finger,bad arm,bad leg,bad eye");
 
-        // 使用Freemarker模板引擎，根据模型参数生成ComfyUI工作流JSON字符串
+        // 使用Freemarker生成ComfyUI工作流JSON（模板化工作流便于统一维护）
         String prompt = freemarkerService.renderText2Image(comfyuiModel);
-        // 将JSON字符串解析为对象，构建ComfyUI请求DTO（包含客户端ID和工作流配置）
         ComfyuiRequestDto comfyuiRequestDto = new ComfyuiRequestDto(Constants.COMFYUI_CLIENT_ID, JSON.parseObject(prompt));
 
-        // 创建ComfyUI任务对象，传入WebSocket客户端ID和请求配置
+        // 封装任务对象：包含WS客户端ID、请求体、用户与图片数量等
         ComfyuiTask comfyuiTask = new ComfyuiTask(text2ImageReqDto.getClientId(), comfyuiRequestDto);
-        // 从ThreadLocal中获取当前登录用户ID并设置到任务对象
         comfyuiTask.setUserId(UserUtils.getUser().getId());
-        // 设置需要生成的图片数量
         comfyuiTask.setSize(text2ImageReqDto.getSize());
-        // 返回封装好的任务对象
         return comfyuiTask;
     }
 
     /**
      * 文生图接口实现
-     *
-     * @param text2ImageReqDto
-     * @return
-     * @throws Exception
      */
     @Override
     public Text2ImageResDto textToImage(Text2ImageReqDto text2ImageReqDto) throws Exception {
-        // 验证生成图片数量参数，必须大于等于1
         if (text2ImageReqDto.getSize() < 1) {
             throw new CustomException("请求参数错误！");
         }
         
-        // 获取当前用户ID
         Long userId = UserUtils.getUser().getId();
-        
-        // 先冻结用户积分（按图片数量扣除），防止用户积分不足或恶意提交
+        // 先冻结积分：任务完成时扣除；失败/异常时归还
         userFundRecordService.pointsFreeze(userId, text2ImageReqDto.getSize());
         
         try {
-            // 将用户请求封装为ComfyUI任务对象（包含翻译提示词、生成工作流等）
+            // 组装任务并入队到Redis优先级队列
             ComfyuiTask comfyuiTask = getComfyuiTask(text2ImageReqDto);
-            // 将任务添加到Redis优先级队列，返回带有队列位置的任务对象
             comfyuiTask = redisService.addQueueTask(comfyuiTask);
-            // 构造响应对象
             Text2ImageResDto text2ImageResDto = new Text2ImageResDto();
-            // 设置任务临时ID（用于后续取消、插队等操作）
             text2ImageResDto.setPid(comfyuiTask.getId());
-            // 设置任务在队列中的序号（告知用户前面还有多少任务）
             text2ImageResDto.setQueueIndex(comfyuiTask.getIndex());
-            // 返回响应给前端
             return text2ImageResDto;
         } catch (Exception e) {
-            // 【Bug修复】如果创建任务或加入队列失败（如：Ollama翻译失败、Freemarker渲染失败）
-            // 必须归还已冻结的积分，否则积分会永久冻结
             log.error("创建文生图任务失败，归还用户{}的积分{}", userId, text2ImageReqDto.getSize(), e);
-            userFundRecordService.freezeReturn(userId, text2ImageReqDto.getSize());
+            // 入队失败或系统异常：归还冻结积分（失败会自动补偿，无需阻塞用户）
+            refundCompensationService.safeRefund(userId, text2ImageReqDto.getSize(), 
+                    "create_task_" + System.currentTimeMillis(), "create_task_failed_refund");
+            // 抛出原始异常，告知用户任务创建失败（退款会在后台处理）
             throw e;
         }
     }
 
     /**
-     * 取消文生图任务（使用分布式锁保证并发安全）
+     * 取消文生图任务（智能取消：队列中的直接删除，执行中的调用中断接口）
      *
-     * @param cancelReqDto
-     * @throws Exception
+     * @param cancelReqDto 取消请求参数
+     * @throws Exception 处理异常
      */
     @Override
     public void cancelTask(Text2ImageCancelReqDto cancelReqDto) throws Exception {
-        // 从请求DTO中获取任务临时ID
         String tempId = cancelReqDto.getTempId();
-        // 校验任务ID不能为空
         if (tempId == null || tempId.trim().isEmpty()) {
             throw new CustomException("任务ID不能为空");
         }
         
-        // 从ThreadLocal中获取当前登录用户ID（只获取一次，避免重复调用）
         Long currentUserId = UserUtils.getUser().getId();
-        // 记录取消操作日志
         log.info("用户{}尝试取消任务{}", currentUserId, tempId);
         
-        // 构造分布式锁的key（每个任务一个锁）
+        // 使用分布式锁防止并发取消
         String lockKey = LOCK_KEY_PREFIX + tempId;
-        // 生成随机锁值，用于释放时验证是否是自己的锁
         String lockValue = UUID.randomUUID().toString();
         
-        // 尝试获取分布式锁，防止并发取消同一任务
         if (!tryLock(lockKey, lockValue)) {
-            // 获取锁失败，说明有其他请求正在处理该任务
             log.warn("用户{}取消任务{}失败: 获取锁失败", currentUserId, tempId);
             throw new CustomException("操作过于频繁，请稍后再试");
         }
         
-        // 标记任务是否已从Redis删除，用于异常时判断是否需要重新加入队列或归还积分
-        boolean taskRemoved = false;
-        ComfyuiTask queueTask = null;
-        
         try {
-            // 验证任务是否存在、是否已开始、当前用户是否有权限操作
-            queueTask = validateTaskAndPermission(tempId, currentUserId);
+            // 检查任务状态：getTaskRank返回1表示正在执行，>1表示在队列中，null表示不存在
+            Long currentRank = redisService.getTaskRank(tempId);
+            log.info("用户{}取消任务{}，当前排名: {}", currentUserId, tempId, currentRank);
             
-            // 从Redis ZSet队列和String存储中删除任务
+            if (currentRank == null) {
+                // 任务不存在或已完成
+                log.warn("用户{}取消任务{}失败: 任务不存在或已完成", currentUserId, tempId);
+                throw new CustomException("任务不存在或已完成");
+            }
+            
+            if (currentRank == 1L) {
+                // 任务正在执行中，需要调用中断接口
+                log.info("任务{}正在执行中（排名=1），用户{}尝试中断任务", tempId, currentUserId);
+                
+                ComfyuiTask runningTask = findRunningTask(tempId);
+                if (runningTask == null) {
+                    log.error("任务{}排名为1但找不到执行中的任务详情", tempId);
+                    throw new CustomException("任务状态异常，请稍后重试");
+                }
+                
+                // 验证任务所有权
+                if (!currentUserId.equals(runningTask.getUserId())) {
+                    log.warn("用户{}尝试取消非本人任务{}，任务所有者: {}", currentUserId, tempId, runningTask.getUserId());
+                    throw new CustomException("无权限操作该任务");
+                }
+                
+                // 第一步：调用中断接口（带重试机制）
+                boolean interruptSuccess = interruptTaskWithRetry(tempId, currentUserId);
+                
+                if (!interruptSuccess) {
+                    // 中断失败（重试多次后仍失败），不退款
+                    log.error("用户{}中断任务{}失败（已重试{}次），任务将继续执行，不退款", 
+                            currentUserId, tempId, INTERRUPT_MAX_RETRIES);
+                    throw new CustomException("任务中断失败，请稍后重试");
+                }
+                
+                // 第二步：中断成功后再退款
+                log.info("用户{}成功中断任务{}，开始归还积分", currentUserId, tempId);
+                boolean refundSuccess = refundCompensationService.safeRefund(
+                        runningTask.getUserId(), runningTask.getSize(), tempId, "interrupt_refund_failed");
+                
+                if (!refundSuccess) {
+                    // 退款失败，已自动加入补偿队列
+                    throw new CustomException("任务已中断，积分正在处理中，请稍后查看账户余额");
+                }
+                return;
+            }
+            
+            // 任务在队列中（排名>1），直接删除并退款
+            log.info("任务{}在队列中（排名={}），直接删除", tempId, currentRank);
+            ComfyuiTask queueTask = redisService.getQueueTask(tempId);
+            if (queueTask == null) {
+                log.error("任务{}有排名但获取详情失败", tempId);
+                throw new CustomException("任务状态异常，请稍后重试");
+            }
+            
+            // 验证权限
+            if (!currentUserId.equals(queueTask.getUserId())) {
+                throw new CustomException("无权限操作该任务");
+            }
+            
+            // 从队列中删除任务
             boolean removed = redisService.removeQueueTask(tempId);
-            // 判断删除是否成功
             if (!removed) {
-                // 删除失败，记录错误日志
                 log.error("用户{}取消任务{}失败: Redis删除失败", currentUserId, tempId);
                 throw new CustomException("任务取消失败");
             }
             
-            taskRemoved = true;  // 标记任务已删除
+            // 归还冻结的积分（取消不扣费）
+            boolean refundSuccess = refundCompensationService.safeRefund(
+                    queueTask.getUserId(), queueTask.getSize(), tempId, "queue_cancel_refund_failed");
             
-            // 任务取消成功，将冻结的积分返还到用户可用账户
-            userFundRecordService.freezeReturn(queueTask.getUserId(), queueTask.getSize());
-            // 记录成功日志，包含归还的积分数量
-            log.info("用户{}成功取消任务{}，归还积分{}", currentUserId, tempId, queueTask.getSize());
+            if (!refundSuccess) {
+                // 退款失败，已自动加入补偿队列
+                throw new CustomException("任务已取消，积分正在处理中，请稍后查看账户余额");
+            }
         } catch (CustomException e) {
-            // 业务异常（如：任务不存在、无权限等）直接抛出，不记录堆栈
             throw e;
         } catch (Exception e) {
-            // 【Bug修复】系统异常时，如果任务已删除但积分归还失败，必须确保积分归还
-            if (taskRemoved && queueTask != null) {
-                log.error("用户{}取消任务{}成功，但归还积分时发生异常，重试归还", currentUserId, tempId, e);
-                try {
-                    userFundRecordService.freezeReturn(queueTask.getUserId(), queueTask.getSize());
-                    log.info("重试归还积分成功，用户{}积分{}", queueTask.getUserId(), queueTask.getSize());
-                } catch (Exception refundException) {
-                    // 归还积分失败，记录严重错误，需要人工介入
-                    log.error("取消任务后归还积分失败！用户{}需要人工补偿积分{}，任务已从队列删除", 
-                            queueTask.getUserId(), queueTask.getSize(), refundException);
-                }
-            } else {
-                // 任务未删除前的异常，直接抛出
-                log.error("用户{}取消任务{}发生系统异常", currentUserId, tempId, e);
-            }
+            log.error("用户{}取消任务{}发生系统异常", currentUserId, tempId, e);
             throw new CustomException("任务取消失败");
         } finally {
-            // finally块确保锁一定会被释放，即使发生异常
             try {
-                // 释放分布式锁
+                // 释放分布式锁（使用Lua脚本保证原子性）
                 unlock(lockKey, lockValue);
             } catch (Exception e) {
-                // 释放锁失败不影响主逻辑，只记录日志，避免掩盖原始异常
                 log.error("释放锁失败: lockKey={}", lockKey, e);
             }
         }
-    }
-
-    /**
-     * 获取用户文生图历史列表
-     *
-     * @param listReqDto
-     * @return
-     */
-    @Override
-    public PageResult<List<UserResult>> getUserImageList(Text2ImageListReqDto listReqDto) {
-        // 从ThreadLocal中获取当前登录用户ID
-        Long userId = UserUtils.getUser().getId();
-        
-        // 参数校验：获取请求的页码和每页数量
-        Integer pageNum = listReqDto.getPageNum();
-        Integer pageSize = listReqDto.getPageSize();
-        // 如果页码小于最小值，设置为最小值（1）
-        if (pageNum < MIN_PAGE_SIZE) {
-            pageNum = MIN_PAGE_SIZE;
-        }
-        // 如果每页数量超出合理范围，设置为默认值（10）
-        if (pageSize < MIN_PAGE_SIZE || pageSize > MAX_PAGE_SIZE) {
-            pageSize = DEFAULT_PAGE_SIZE;
-        }
-        
-        // 构建 MyBatis Plus 的分页对象
-        Page<UserResult> page = new Page<>(pageNum, pageSize);
-        // 构建 Lambda 查询条件包装器
-        LambdaQueryWrapper<UserResult> queryWrapper = new LambdaQueryWrapper<>();
-        // 设置查询条件：只查询当前用户的记录
-        queryWrapper.eq(UserResult::getUserId, userId)
-                    // 按创建时间降序排序（最新的在最前）
-                    .orderByDesc(UserResult::getCreatedTime);
-        
-        // 执行分页查询，返回分页结果对象
-        IPage<UserResult> resultPage = userResultService.page(page, queryWrapper);
-        
-        // 将 MyBatis Plus 的分页结果转换为自定义的 PageResult 对象返回
-        // 包含总数量和当前页的记录列表
-        return PageResult.ok(resultPage.getTotal(), resultPage.getRecords());
     }
 
     /**
@@ -346,40 +285,41 @@ public class Text2ImageServiceImpl implements Text2ImageService {
     }
 
     /**
-     * 验证任务并检查权限（通用方法）
-     * 
-     * @param tempId 任务ID
-     * @param currentUserId 当前用户ID（可选，传入null则内部获取）
-     * @return 任务对象
+     * 获取用户文生图历史列表
+     *
+     * @param listReqDto 请求分页参数
+     * @return 分页结果
      */
-    private ComfyuiTask validateTaskAndPermission(String tempId, Long currentUserId) {
-        // 第一步：检查任务在队列中的排名（判断任务是否已经开始执行）
-        Long currentRank = redisService.getTaskRank(tempId);
-        // 如果排名为null，说明任务已经从队列中弹出（正在执行或已完成）
-        if (currentRank == null) {
-            throw new CustomException("任务已经开始或不存在");
+    @Override
+    public PageResult<List<UserResult>> getUserImageList(Text2ImageListReqDto listReqDto) {
+        // 从ThreadLocal中获取当前登录用户ID
+        Long userId = UserUtils.getUser().getId();
+
+        // 参数校验：获取请求的页码和每页数量
+        Integer pageNum = listReqDto.getPageNum();
+        Integer pageSize = listReqDto.getPageSize();
+        // 如果页码小于最小值，设置为最小值（1）
+        if (pageNum < MIN_PAGE_SIZE) {
+            pageNum = MIN_PAGE_SIZE;
         }
-        
-        // 第二步：获取任务的详细信息
-        ComfyuiTask queueTask = redisService.getQueueTask(tempId);
-        // 如果任务不存在，抛出异常
-        if (queueTask == null) {
-            throw new CustomException("任务不存在");
+        // 如果每页数量超出合理范围，设置为默认值（10）
+        if (pageSize < MIN_PAGE_SIZE || pageSize > MAX_PAGE_SIZE) {
+            pageSize = DEFAULT_PAGE_SIZE;
         }
-        
-        // 第三步：验证当前用户是否有权限操作该任务
-        if (currentUserId == null) {
-            // 如果没有传入用户ID，从ThreadLocal获取
-            currentUserId = UserUtils.getUser().getId();
-        }
-        // 对比任务的所有者ID和当前用户ID
-        if (!currentUserId.equals(queueTask.getUserId())) {
-            // 如果不是任务的所有者，无权操作
-            throw new CustomException("无权限操作该任务");
-        }
-        
-        // 验证通过，返回任务对象
-        return queueTask;
+
+        // 构建 MyBatis Plus 的分页对象
+        Page<UserResult> page = new Page<>(pageNum, pageSize);
+        // 构建 Lambda 查询条件包装器
+        LambdaQueryWrapper<UserResult> queryWrapper = new LambdaQueryWrapper<>();
+        // 设置查询条件：只查询当前用户的记录，按创建时间倒序
+        queryWrapper.eq(UserResult::getUserId, userId)
+                .orderByDesc(UserResult::getCreatedTime);
+
+        // 执行分页查询
+        IPage<UserResult> resultPage = userResultService.page(page, queryWrapper);
+
+        // 转换为自定义分页结果返回
+        return PageResult.ok(resultPage.getTotal(), resultPage.getRecords());
     }
 
     /**
@@ -445,7 +385,7 @@ public class Text2ImageServiceImpl implements Text2ImageService {
                 throw new CustomException("无权限操作该任务");
             }
             
-            // 先扣除积分，再提升优先级，避免用户未付费但优先级已提升
+            // 先扣除积分，再提升优先级，避免用户未付费但优先级已提升（资金一致性优先）
             userFundRecordService.directDeduction(queueTask.getUserId(), PRIORITY_COST);
             
             // 标记积分是否已扣除，用于异常时判断是否需要归还
@@ -519,58 +459,113 @@ public class Text2ImageServiceImpl implements Text2ImageService {
         String tempId = priorityReqDto.getTempId();
         Long currentUserId = UserUtils.getUser().getId();
 
-        // 先从Redis获取实时排名
+        // 先从Redis获取实时排名（包含正在执行的任务数）
         Long rank = redisService.getTaskRank(tempId);
+        // 返回实时排名
+        return rank;
+    }
+
+    /**
+     * 查找正在执行的任务
+     * 
+     * @param tempId 任务ID
+     * @return 如果任务正在执行返回任务对象，否则返回null
+     */
+    private ComfyuiTask findRunningTask(String tempId) {
+        log.info("开始查找正在执行的任务: tempId={}", tempId);
         
-        // 如果任务不在队列中也不在执行中（已完成或被取消），返回null
-        if (rank == null) {
-            return null;
+        // 先尝试从临时占位符获取（优先级最高）
+        String tempKey = "run_task_temp_" + tempId;
+        String tempJson = stringRedisTemplate.opsForValue().get(tempKey);
+        log.info("检查临时占位符: key={}, 存在={}", tempKey, tempJson != null);
+        
+        if (StrUtil.isNotEmpty(tempJson)) {
+            try {
+                ComfyuiTask task = JSON.parseObject(tempJson, ComfyuiTask.class);
+                log.info("从临时占位符找到任务: tempId={}", tempId);
+                return task;
+            } catch (Exception e) {
+                log.warn("解析临时任务JSON失败: {}", tempId, e);
+            }
         }
         
-        // 任务可能在队列中，也可能正在执行
-        // 先尝试从队列获取
-        ComfyuiTask task = redisService.getQueueTask(tempId);
+        // 遍历所有run_task_*，查找匹配的任务
+        java.util.Set<String> runningKeys = stringRedisTemplate.keys("run_task_*");
+        log.info("开始遍历正在执行的任务，总数: {}", runningKeys != null ? runningKeys.size() : 0);
         
-        // 如果队列中没有，可能正在执行，从执行任务中获取
-        if (task == null) {
-            // 尝试从临时占位符获取
-            String tempJson = stringRedisTemplate.opsForValue().get("run_task_temp_" + tempId);
-            if (StrUtil.isNotEmpty(tempJson)) {
-                task = JSON.parseObject(tempJson, ComfyuiTask.class);
-            } else {
-                // 遍历所有run_task_*，查找匹配的任务
-                java.util.Set<String> runningKeys = stringRedisTemplate.keys("run_task_*");
-                if (runningKeys != null) {
-                    for (String key : runningKeys) {
-                        if (key.contains("temp_")) continue;
-                        String json = stringRedisTemplate.opsForValue().get(key);
-                        if (StrUtil.isNotEmpty(json)) {
-                            try {
-                                ComfyuiTask runningTask = JSON.parseObject(json, ComfyuiTask.class);
-                                if (runningTask != null && tempId.equals(runningTask.getId())) {
-                                    task = runningTask;
-                                    break;
-                                }
-                            } catch (Exception e) {
-                                // 忽略解析异常
-                            }
+        if (runningKeys != null) {
+            for (String key : runningKeys) {
+                // 跳过临时占位符（已在上面处理）
+                if (key.contains("temp_")) {
+                    log.debug("跳过临时占位符key: {}", key);
+                    continue;
+                }
+                
+                String json = stringRedisTemplate.opsForValue().get(key);
+                if (StrUtil.isNotEmpty(json)) {
+                    try {
+                        ComfyuiTask runningTask = JSON.parseObject(json, ComfyuiTask.class);
+                        log.info("检查任务: key={}, taskId={}, 目标tempId={}, 匹配={}", 
+                                key, runningTask != null ? runningTask.getId() : "null", tempId, 
+                                runningTask != null && tempId.equals(runningTask.getId()));
+                        
+                        if (runningTask != null && tempId.equals(runningTask.getId())) {
+                            log.info("找到匹配的正在执行任务: tempId={}, key={}", tempId, key);
+                            return runningTask;
                         }
+                    } catch (Exception e) {
+                        // 忽略解析异常，继续查找下一个
+                        log.debug("解析运行中任务JSON失败: {}", key, e);
                     }
                 }
             }
         }
         
-        // 如果任务不存在，返回null
-        if (task == null) {
-            return null;
+        // 未找到正在执行的任务
+        log.warn("未找到正在执行的任务: tempId={}", tempId);
+        return null;
+    }
+    
+    /**
+     * 带重试机制的中断任务
+     * 
+     * @param tempId 任务ID
+     * @param currentUserId 当前用户ID
+     * @return 是否中断成功
+     */
+    private boolean interruptTaskWithRetry(String tempId, Long currentUserId) {
+        for (int attempt = 1; attempt <= INTERRUPT_MAX_RETRIES; attempt++) {
+            try {
+                log.info("用户{}尝试中断任务{}，第{}次尝试", currentUserId, tempId, attempt);
+                Response<Void> response = comfyuiApi.interruptTask().execute();
+                
+                if (response.isSuccessful()) {
+                    log.info("用户{}成功中断任务{}（第{}次尝试成功）", currentUserId, tempId, attempt);
+                    return true;
+                } else {
+                    log.warn("用户{}中断任务{}失败（第{}次），HTTP状态码: {}", 
+                            currentUserId, tempId, attempt, response.code());
+                }
+            } catch (Exception e) {
+                log.warn("用户{}中断任务{}异常（第{}次）: {}", 
+                        currentUserId, tempId, attempt, e.getMessage());
+            }
+            
+            // 如果不是最后一次尝试，等待后重试
+            if (attempt < INTERRUPT_MAX_RETRIES) {
+                try {
+                    Thread.sleep(INTERRUPT_RETRY_DELAY_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.warn("中断重试等待被打断");
+                    break;
+                }
+            }
         }
         
-        // 检查权限
-        if (!currentUserId.equals(task.getUserId())) {
-            throw new CustomException("无权限查询该任务");
-        }
-
-        // 返回实时排名
-        return rank;
+        // 所有重试都失败
+        log.error("用户{}中断任务{}失败，已重试{}次", currentUserId, tempId, INTERRUPT_MAX_RETRIES);
+        return false;
     }
+    
 }

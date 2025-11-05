@@ -35,10 +35,16 @@ public interface Text2ImageService {
     Text2ImageResDto textToImage(Text2ImageReqDto text2ImageReqDto) throws Exception;
     
     /**
-     * 取消文生图任务
+     * 取消文生图任务（智能取消）
+     * 
+     * <p>根据任务状态自动选择取消方式：
+     * <ul>
+     *     <li>队列中的任务：从队列删除并归还冻结积分</li>
+     *     <li>正在执行的任务：调用ComfyUI中断接口</li>
+     * </ul>
      * 
      * @param cancelReqDto 取消请求参数
-     * @throws Exception 当任务已开始或无权限时
+     * @throws Exception 当任务不存在、已完成或无权限时
      */
     void cancelTask(Text2ImageCancelReqDto cancelReqDto) throws Exception;
     
